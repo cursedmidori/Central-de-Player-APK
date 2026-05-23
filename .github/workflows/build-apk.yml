@@ -1,12 +1,9 @@
-name: Gerar APK Flutter Corrigido
+name: Gerar APK Flutter
 
 on:
   workflow_dispatch:
   push:
-    branches: ["main", "master"]
-
-permissions:
-  contents: read
+    branches: [ "main", "master" ]
 
 jobs:
   build-apk:
@@ -16,68 +13,153 @@ jobs:
       - name: Baixar repositório
         uses: actions/checkout@v4
 
+      - name: Instalar Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
       - name: Instalar Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
 
-      - name: Preparar projeto
-        shell: bash
+      - name: Criar/atualizar pasta Android
         run: |
-          set -e
-          if [ ! -f pubspec.yaml ]; then
-            ZIP_FILE=$(find . -maxdepth 1 -name "*.zip" | head -n 1 || true)
-            if [ -z "$ZIP_FILE" ]; then
-              echo "Nenhum pubspec.yaml ou ZIP encontrado na raiz do repositório."
-              exit 1
-            fi
-            echo "Descompactando $ZIP_FILE"
-            rm -rf extracted
-            mkdir extracted
-            unzip -q "$ZIP_FILE" -d extracted
-            PROJECT_DIR=$(find extracted -name pubspec.yaml -exec dirname {} \; | head -n 1)
-            if [ -z "$PROJECT_DIR" ]; then
-              echo "Nenhum pubspec.yaml encontrado dentro do ZIP."
-              exit 1
-            fi
-            echo "Projeto encontrado em $PROJECT_DIR"
-            cp -R "$PROJECT_DIR"/. .
-          fi
+          flutter create . --platforms=android --project-name central_player --org com.orueu
 
-      - name: Corrigir main.dart automaticamente
-        shell: bash
+      - name: Escrever MainActivity com import/export JSON nativo
         run: |
-          set -e
-          python3 - <<'PY'
-          from pathlib import Path
-          old = "mapi(d['stats'])"
-          new = "Map<String, dynamic>.from(d['stats'] as Map)"
-          fixed = 0
-          for path in Path('.').rglob('main.dart'):
-              text = path.read_text(encoding='utf-8')
-              if old in text:
-                  path.write_text(text.replace(old, new), encoding='utf-8')
-                  print(f'Corrigido: {path}')
-                  fixed += 1
-          if fixed == 0:
-              print('Nenhuma ocorrência antiga encontrada. O main.dart já parece corrigido.')
-          PY
-          if grep -R "mapi(d\['stats'\])" -n lib 2>/dev/null; then
-            echo "Ainda existe mapi(d['stats']) em lib/. Corrija o main.dart."
-            exit 1
-          fi
+          mkdir -p android/app/src/main/kotlin/com/orueu/central_player
+          cat > android/app/src/main/kotlin/com/orueu/central_player/MainActivity.kt <<'KOTLIN'
+          package com.orueu.central_player
 
-      - name: Criar Android se não existir
-        run: flutter create --platforms=android --project-name central_player .
+          import android.app.Activity
+          import android.content.Intent
+          import android.net.Uri
+          import io.flutter.embedding.android.FlutterActivity
+          import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.plugin.common.MethodChannel
+          import java.io.BufferedReader
+          import java.io.InputStreamReader
+          import java.io.OutputStreamWriter
+
+          class MainActivity : FlutterActivity() {
+              private val channelName = "central_player/json_files"
+              private var pendingResult: MethodChannel.Result? = null
+              private var pendingContent: String? = null
+
+              companion object {
+                  private const val REQUEST_OPEN_JSON = 4101
+                  private const val REQUEST_SAVE_JSON = 4102
+              }
+
+              override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+                  super.configureFlutterEngine(flutterEngine)
+
+                  MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName).setMethodCallHandler { call, result ->
+                      if (pendingResult != null) {
+                          result.error("BUSY", "Já existe uma operação de arquivo em andamento.", null)
+                          return@setMethodCallHandler
+                      }
+
+                      when (call.method) {
+                          "openJson" -> {
+                              pendingResult = result
+                              val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                                  addCategory(Intent.CATEGORY_OPENABLE)
+                                  type = "application/json"
+                                  putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("application/json", "text/json", "text/plain", "*/*"))
+                              }
+                              try {
+                                  startActivityForResult(intent, REQUEST_OPEN_JSON)
+                              } catch (e: Exception) {
+                                  pendingResult = null
+                                  result.error("OPEN_FAILED", e.message, null)
+                              }
+                          }
+
+                          "saveJson" -> {
+                              val fileName = call.argument<String>("fileName") ?: "ficha_central_player.json"
+                              pendingContent = call.argument<String>("content") ?: ""
+                              pendingResult = result
+
+                              val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                                  addCategory(Intent.CATEGORY_OPENABLE)
+                                  type = "application/json"
+                                  putExtra(Intent.EXTRA_TITLE, fileName)
+                              }
+                              try {
+                                  startActivityForResult(intent, REQUEST_SAVE_JSON)
+                              } catch (e: Exception) {
+                                  pendingContent = null
+                                  pendingResult = null
+                                  result.error("SAVE_FAILED", e.message, null)
+                              }
+                          }
+
+                          else -> result.notImplemented()
+                      }
+                  }
+              }
+
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+
+                  val result = pendingResult ?: return
+                  pendingResult = null
+
+                  if (resultCode != Activity.RESULT_OK || data?.data == null) {
+                      pendingContent = null
+                      result.success(null)
+                      return
+                  }
+
+                  val uri: Uri = data.data!!
+
+                  try {
+                      when (requestCode) {
+                          REQUEST_OPEN_JSON -> {
+                              val input = contentResolver.openInputStream(uri)
+                              val text = BufferedReader(InputStreamReader(input, Charsets.UTF_8)).use { it.readText() }
+                              result.success(text)
+                          }
+
+                          REQUEST_SAVE_JSON -> {
+                              val content = pendingContent ?: ""
+                              pendingContent = null
+                              val output = contentResolver.openOutputStream(uri)
+                              OutputStreamWriter(output, Charsets.UTF_8).use { it.write(content) }
+                              result.success(true)
+                          }
+
+                          else -> result.success(null)
+                      }
+                  } catch (e: Exception) {
+                      pendingContent = null
+                      result.error("FILE_ERROR", e.message, null)
+                  }
+              }
+          }
+          KOTLIN
 
       - name: Baixar dependências
         run: flutter pub get
 
+      - name: Conferir dependências problemáticas
+        run: |
+          echo "pubspec.yaml:"
+          cat pubspec.yaml
+          if grep -R "file_picker\|share_plus\|path_provider" pubspec.yaml pubspec.lock 2>/dev/null; then
+            echo "Dependência problemática encontrada."
+            exit 1
+          fi
+
       - name: Gerar APK Debug
         run: flutter build apk --debug
 
-      - name: Enviar APK
+      - name: Enviar APK como artefato
         uses: actions/upload-artifact@v4
         with:
-          name: central-player-debug-apk
+          name: central-player-v5-4-debug-apk
           path: build/app/outputs/flutter-apk/app-debug.apk
